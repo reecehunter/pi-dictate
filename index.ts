@@ -14,21 +14,27 @@
  * focus is invisible to us — Tab into the note/Other field first so the text
  * lands there.
  *
- * Stop rule: the delivery target is resolved fresh at stop time and the
- * transcript goes to whatever is focused THEN (editor-like components get a
- * direct setText append; opaque components get synthetic keystrokes). If
- * nothing text-capable is focused at stop, the transcript is copied to the
- * clipboard and a notification says so — a finished dictation is never lost.
+ * Streaming rule: each finalized utterance is inserted the moment Deepgram
+ * emits it, so text lands roughly a phrase at a time while you talk. The
+ * delivery target is resolved for EVERY utterance, so if focus moves
+ * mid-dictation the next phrase follows it (editor-like components get a
+ * direct setText append; opaque components get synthetic keystrokes). Any
+ * utterance that arrives while nothing text-capable is focused is held and
+ * delivered on stop; if there is still nowhere to put it, it is copied to the
+ * clipboard and a notification says so — dictation is never lost.
  *
  * Requires:
  *   - sox installed (`brew install sox` — provides the `rec` command)
  *   - DEEPGRAM_API_KEY environment variable set
  *
  * Streaming model: audio is sent to Deepgram while you talk; the server
- * transcribes in real time and emits per-utterance "final" results. We
- * collect those finals and inject the concatenated text on stop. No
- * partials are shown in the editor (cosmetic-only), so quality is good
- * and the editor never shows revisable text.
+ * transcribes in real time and emits per-utterance "final" results, each of
+ * which is inserted immediately (append-only). Interim results stay disabled
+ * so we never have to rewrite text that is already committed — that is what
+ * keeps live insertion safe in every input component. Because delivery is
+ * append-only, cancel (alt+n) can genuinely unwind what was inserted:
+ * editors have their appended suffix stripped, and opaque typable components
+ * get synthetic backspaces.
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -134,6 +140,9 @@ export default function (pi: ExtensionAPI) {
   let ws: WebSocket | null = null;
   let finals: string[] = [];
   let activeCtx: ExtensionContext | null = null;
+  // Utterances that arrived while nothing text-capable was focused. They are
+  // retried on stop so a temporary focus loss doesn't eat spoken words.
+  let undelivered: string[] = [];
   let flushed = false;
   let cancelled = false;
   let stopTimeout: NodeJS.Timeout | null = null;
@@ -226,15 +235,80 @@ export default function (pi: ExtensionAPI) {
     return null;
   };
 
+  // ── Live insertion ───────────────────────────────────────────────────────
+  // Every utterance is inserted as soon as it is finalized. We remember
+  // exactly what went into which component so cancel can unwind it.
+  const inserted = new Map<any, string[]>();
+
+  const recordInsert = (component: any, added: string) => {
+    const chunks = inserted.get(component);
+    if (chunks) chunks.push(added);
+    else inserted.set(component, [added]);
+  };
+
+  /** Append `text` to whatever is focused right now. False if nowhere to put it. */
+  const insertText = (text: string): boolean => {
+    const target = resolveTarget();
+    if (!target) return false;
+    if (target.kind === "editor") {
+      const current = target.editor.getText() ?? "";
+      const sep = current && !/\s$/.test(current) ? " " : "";
+      target.editor.setText(current + sep + text);
+      recordInsert(target.editor, sep + text);
+    } else {
+      // Synthetic typing: the component routes the text wherever its
+      // internal focus is. Text is plain printable words (whitespace
+      // already normalized), so no keybindings/autocomplete can trigger.
+      target.component.handleInput(text);
+      recordInsert(target.component, text);
+    }
+    tuiHandle?.requestRender?.();
+    return true;
+  };
+
+  /** Undo live insertions (cancel). Best effort, per target kind. */
+  const revertInserted = () => {
+    for (const [component, chunks] of inserted) {
+      const editor = asEditorLike(component);
+      if (editor) {
+        // Strip only what is still the literal tail of the field: if the user
+        // edited after our append, leave their text alone.
+        let current = editor.getText() ?? "";
+        for (let i = chunks.length - 1; i >= 0; i--) {
+          const added = chunks[i]!;
+          if (added && current.endsWith(added)) current = current.slice(0, -added.length);
+        }
+        editor.setText(current);
+      } else if (typeof component?.handleInput === "function") {
+        // Opaque target: it can't be read back, so replay the deletion as
+        // backspaces through the same synthetic-keystroke path we typed with.
+        const typed = chunks.join("");
+        for (let i = 0; i < Array.from(typed).length; i++) component.handleInput("\x7f");
+      }
+    }
+    inserted.clear();
+    tuiHandle?.requestRender?.();
+  };
+
+  /** Normalize + insert one finalized utterance live (or hold it for stop). */
+  const deliverFinal = (raw: string) => {
+    if (cancelled) return;
+    const text = raw.replace(/\s+/g, " ").trim();
+    if (!text) return;
+    finals.push(text);
+    if (!tuiHandle) return; // legacy: nothing can stream, flush() appends on stop
+    if (!insertText(text)) undelivered.push(text);
+  };
+
   const flush = () => {
     if (flushed || !activeCtx) return;
     flushed = true;
-    if (cancelled) return; // discard transcript on cancel
+    if (cancelled) return; // cancel already unwound everything we inserted
     const text = finals.join(" ").replace(/\s+/g, " ").trim();
     if (!text) return;
 
     // Legacy fallback: no TUI handle captured (non-TUI mode / older pi) —
-    // append to the main chat editor exactly as before.
+    // nothing streamed live, so append the whole transcript as before.
     if (!tuiHandle) {
       const current = activeCtx.ui.getEditorText() ?? "";
       const sep = current && !/\s$/.test(current) ? " " : "";
@@ -242,28 +316,17 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    // Resolve the target NOW — focus may have changed while dictating.
-    const target = resolveTarget();
-    if (target?.kind === "editor") {
-      const current = target.editor.getText() ?? "";
-      const sep = current && !/\s$/.test(current) ? " " : "";
-      target.editor.setText(current + sep + text);
-      tuiHandle.requestRender?.();
-      return;
-    }
-    if (target?.kind === "typable") {
-      // Synthetic typing: the component routes the text wherever its
-      // internal focus is. Text is plain printable words (whitespace
-      // already normalized), so no keybindings/autocomplete can trigger.
-      target.component.handleInput(text);
-      tuiHandle.requestRender?.();
-      return;
-    }
-    // Nothing to type into: don't throw the transcript away — stash it on
+    // Everything landed live → nothing left to do.
+    if (!undelivered.length) return;
+    const leftover = undelivered.join(" ").replace(/\s+/g, " ").trim();
+    undelivered = [];
+    if (!leftover || insertText(leftover)) return;
+
+    // Still nowhere to type: don't throw the transcript away — stash it on
     // the clipboard and say so.
     try {
       const p = spawn("pbcopy", [], { stdio: ["pipe", "ignore", "ignore"] });
-      p.stdin.end(text);
+      p.stdin.end(leftover);
     } catch {}
     activeCtx.ui.notify("Dictation finished but no input field is focused — transcript copied to clipboard", "warning");
   };
@@ -293,6 +356,8 @@ export default function (pi: ExtensionAPI) {
       ws = null;
     }
     finals = [];
+    undelivered = [];
+    inserted.clear();
     state = "idle";
     setStatus(undefined);
     activeCtx = null;
@@ -309,6 +374,8 @@ export default function (pi: ExtensionAPI) {
 
     activeCtx = ctx;
     finals = [];
+    undelivered = [];
+    inserted.clear();
     flushed = false;
     cancelled = false;
     state = "recording";
@@ -393,8 +460,9 @@ export default function (pi: ExtensionAPI) {
       try {
         const msg = JSON.parse(ev.data as string);
         if (msg.type === "Results" && msg.is_final) {
+          // Insert straight away — this is what makes dictation stream.
           const t = msg.channel?.alternatives?.[0]?.transcript;
-          if (t) finals.push(t);
+          if (t) deliverFinal(t);
         }
         // We could also handle msg.type === "Metadata" (sent after CloseStream
         // finishes draining), but ws.close handles the same flush path.
@@ -426,7 +494,7 @@ export default function (pi: ExtensionAPI) {
     });
   };
 
-  /** Stop dictation, finalize transcript, append to editor. */
+  /** Stop dictation, let Deepgram flush its last utterance, then finalize. */
   const stopDictation = () => {
     if (state !== "recording") return;
     state = "stopping";
@@ -461,7 +529,9 @@ export default function (pi: ExtensionAPI) {
   const cancelDictation = () => {
     if (state !== "recording" && state !== "stopping") return;
     cancelled = true;
+    revertInserted(); // live text is already in the field — take it back out
     finals = [];
+    undelivered = [];
     // No need to wait for Deepgram to flush — we're throwing the result away.
     cleanup();
   };

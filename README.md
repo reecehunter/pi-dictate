@@ -3,15 +3,16 @@
 Minimal voice dictation for pi. No floating bubbles, no menu bar app, no notifications.
 
 - **Toggle:** `alt+m` (press to start, press again to stop) — works **anywhere in pi**, not just the main chat input: quiz popups, `ask_user_question`, `ctx.ui.editor()`/`input()` dialogs, selectors. The key is intercepted at the TUI input layer, before whatever component has focus.
-- **Cancel:** `alt+n` (discard the in-flight transcript; safe to press anytime, no-op when no dictation is in flight)
-- **Where text goes:** to whatever input field is focused **when you stop** (never replaces, always appends):
+- **Cancel:** `alt+n` (discard the in-flight transcript; safe to press anytime, no-op when no dictation is in flight). Because text streams in live, cancel also **takes back** what was inserted: appended text is stripped from editors, and typed text is erased with backspaces in opaque dialogs.
+- **Where text goes:** to whatever input field is focused **as each phrase is finalized** (never replaces, always appends):
   - Main chat editor or any `ctx.ui.editor()`/`input()` popup → appended directly.
   - Opaque dialogs (quiz / ask_user_question selects) → typed in as keystrokes. Their internal focus is invisible to the extension, so **Tab into the note/Other field first** — that's where the text will land.
-  - Nothing text-capable focused → transcript is copied to the clipboard (via `pbcopy`, so macOS-only) and a notification says so. A finished dictation is never lost.
+  - Nothing text-capable focused → those phrases are held and delivered when you stop. If there is still nowhere to put them, the transcript is copied to the clipboard (via `pbcopy`, so macOS-only) and a notification says so. A finished dictation is never lost.
+  - Focus is re-resolved for **every** phrase, so if a dialog opens (or you Tab elsewhere) mid-dictation, the remaining words follow the new focus.
 - **Start guard:** if no input field is focused when you press `alt+m`, dictation doesn't start and a notification explains why.
 - **Live feedback:** while recording, the status row shows a red `●` plus a real-time mic-level meter (`● ▂▅▇ listening…`) — instant confirmation your mic is live. On stop it flips to a `finalizing…` spinner.
 - **Backend:** Deepgram Nova-3 streaming
-- **What's "real-time":** audio is transcribed *while you talk*; the finalized text is inserted in one shot when you stop. Stop-to-display latency is typically ~300-500ms.
+- **What's "real-time":** audio is transcribed *while you talk* and each finalized utterance is inserted **as it lands** — text appears roughly a phrase at a time, so you watch it type itself. Per-chunk latency is typically ~300-500ms.
 
 [![dictate demo](assets/dictate.png)](https://www.youtube.com/watch?v=gYxZt9Qe0fk)
 
@@ -36,10 +37,10 @@ Sign up at https://console.deepgram.com — $200 free credit, no card. The Nova-
 
 1. Focus any pi input field — the main chat input, a quiz note field, an `ask_user_question` answer box.
 2. Press `alt+m`. The status row shows a red `●` with a live mic-level meter: `● ▁▂▃▅ listening…`. The bars move with your voice — if they stay flat, no audio is reaching the extension.
-3. Talk.
-4. Press `alt+m` again. The meter is replaced by a braille spinner (`⠋ finalizing…`), then the text appears in the focused input.
+3. Talk. Each phrase shows up in the focused field as Deepgram finalizes it (~300ms after you pause), so the text types itself while you speak.
+4. Press `alt+m` again to finish. The meter is replaced by a braille spinner (`⠋ finalizing…`) until the last utterance lands. Changed your mind? `alt+n` erases what was inserted.
 
-Focus is resolved fresh at stop time, so if a dialog opened (or focus moved) while you were talking, the text goes to whatever is focused at that moment.
+Focus is resolved per phrase, so if a dialog opened (or focus moved) while you were talking, the next words go to whatever is focused at that moment.
 
 Run `/reload` in pi after first install (or after editing `index.ts`) to pick up changes.
 
@@ -47,10 +48,11 @@ Run `/reload` in pi after first install (or after editing `index.ts`) to pick up
 
 - The extension spawns `rec` (sox) capturing 16kHz mono 16-bit PCM to stdout.
 - It opens a Deepgram WebSocket and pipes the PCM stream in.
-- Deepgram returns "final" results (per-utterance, stable) as you talk. Interim/partial results are disabled — the editor never shows revisable text.
+- Deepgram returns "final" results (per-utterance, stable) as you talk. Interim/partial results are disabled — that keeps insertion strictly append-only, so live text never has to be rewritten or revised in place.
+- Each final is normalized and appended to the focused field the moment it arrives; the extension remembers what it inserted into which component so cancel can unwind it (suffix-strip for editors, backspaces for opaque targets).
 - While recording, each audio chunk's RMS loudness is mapped to a bar glyph and shifted through a 6-cell ring every 60ms — the live level meter in the status row.
-- On stop, the extension sends `{"type": "CloseStream"}`, waits for the server to flush, and concatenates all finals. (If Deepgram never closes the socket, a 3s timeout forces finalization.)
-- **Focus-aware delivery:** the extension captures pi's `TUI` instance once (via an invisible zero-height widget) and installs a `tui.addInputListener` handler — listeners run *before* the focused component, which is why `alt+m` works inside dialogs (extension shortcuts are otherwise only matched by the main editor). Kitty-protocol key **release/repeat** events are filtered out, so one physical press toggles exactly once. On stop it inspects `tui.focusedComponent`: editor-like components (anything with `getText`/`setText`, including popups' inner `.editor`) get a direct append; opaque components get the text as synthetic keystrokes routed by their own focus logic.
+- On stop, the extension sends `{"type": "CloseStream"}` and waits for the server to flush its last utterance. (If Deepgram never closes the socket, a 3s timeout forces finalization.)
+- **Focus-aware delivery:** the extension captures pi's `TUI` instance once (via an invisible zero-height widget) and installs a `tui.addInputListener` handler — listeners run *before* the focused component, which is why `alt+m` works inside dialogs (extension shortcuts are otherwise only matched by the main editor). Kitty-protocol key **release/repeat** events are filtered out, so one physical press toggles exactly once. For each utterance it inspects `tui.focusedComponent`: editor-like components (anything with `getText`/`setText`, including popups' inner `.editor`) get a direct append; opaque components get the text as synthetic keystrokes routed by their own focus logic.
 
 ## Customizing
 
@@ -58,7 +60,7 @@ All knobs are at the top of `index.ts`:
 
 - **Hotkey:** change the `Key.alt("m")` / `Key.alt("n")` references near the bottom (the input listener `onGlobalInput` and the fallback `pi.registerShortcut` calls).
 - **Model:** edit `DG_URL` — swap `model=nova-3` for `nova-2`, `enhanced`, etc.
-- **Endpointing (how long a silence ends an utterance):** `endpointing=300` in the URL. Lower = faster finals, more fragmentation. Higher = slower finals, more coherent chunks.
+- **Endpointing (how long a silence ends an utterance):** `endpointing=300` in the URL. Lower = faster insertion, more fragmentation. Higher = chunkier inserts, more coherent phrases. This is the main knob for how "live" the streaming feels.
 - **Smart formatting / punctuation:** toggle `smart_format` and `punctuate` in the URL.
 - **Level meter:** `METER_CELLS` (width in bars), `METER_TICK_MS` (update rate), `METER_FLOOR_DB` / `METER_CEILING_DB` (loudness range mapped to empty/full bars).
 
@@ -89,6 +91,7 @@ See https://pi.dev/docs/latest/tmux for the full pi-on-tmux keyboard guide.
 - **"Failed to spawn 'rec'" / "rec error"** — `brew install sox` and verify with `which rec`.
 - **No mic input** — first check the level meter: if the bars stay flat while you talk, no audio is reaching sox. macOS may need to grant your terminal app microphone access. System Settings → Privacy & Security → Microphone → enable your terminal (Terminal.app, iTerm, Ghostty, etc.).
 - **Nothing happens after stop** — check console output (errors are surfaced as pi notifications). Most common cause: WebSocket couldn't reach Deepgram (firewall, bad key). If you saw "no input field is focused", the transcript was copied to the clipboard — paste with ⌘V.
+- **Text appears in bursts, not word-by-word** — that's by design: only finalized utterances are inserted, so a phrase lands after each short pause. Lower `endpointing` (see Customizing) for tighter bursts. Interim results stay disabled on purpose, because revising already-inserted text is what breaks in opaque dialogs.
 - **Dictated text vanished into a quiz/ask dialog** — the dialog's option list (not its text field) had focus. Tab into the note/Other field before toggling dictation.
 - **`alt+m` inserts `µ` instead of toggling** (macOS) — your terminal isn't treating Option as Alt. In iTerm2: Profile → Keys → Left/Right Option key → `Esc+`. (Ghostty/Kitty/WezTerm do this by default.)
 - **Shortcuts don't work inside tmux** — if you rebound to `ctrl+shift+m`/`ctrl+shift+n`, those collapse to Enter / `Ctrl+N` unless tmux forwards modified keys; see the tmux section above. The default `alt+m`/`alt+n` bindings do not have this problem.
